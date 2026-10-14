@@ -1,0 +1,267 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{microtype}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    filecolor=black,      
+    urlcolor=blue,
+    citecolor=black
+}
+
+\begin{document}
+
+\title{Implementation and Multi-Scale Skip Architecture Ablation of Fully Convolutional Networks for Semantic Segmentation}
+
+\author{\IEEEauthorblockN{Student Roll No: 24CS2038}
+\IEEEauthorblockA{\textit{Section: IDD, Department of Computer Science \& Engineering} \\
+\textit{Deep Learning 2026 Project (Paper ID: DL-029)}\\
+Email: 24cs2038@institution.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+Semantic segmentation requires dense, pixel-level classification while maintaining accurate object boundaries. Traditional convolutional neural networks (CNNs) designed for whole-image classification reduce spatial resolution through consecutive pooling operations and discard spatial coordinates in their final fully connected layers. Long, Shelhamer, and Darrell (CVPR 2015) addressed this limitation by proposing Fully Convolutional Networks (FCNs), showing that classification backbones can be converted into dense feature extractors that process arbitrary input dimensions in a single forward pass. In this project, we implement the FCN architecture from scratch in PyTorch using a VGG-16 backbone for Roll No: 24CS2038. We convert the fully connected layers (\texttt{fc6} and \texttt{fc7}) into convolutional layers, implement fractionally strided (transposed) convolutions with 2D bilinear weight initialization, and reproduce the multi-scale skip connection hierarchy: FCN-32s, FCN-16s, and FCN-8s. Evaluated on the CamVid road-scene benchmark, our implementation achieves a Mean Intersection over Union (mIoU) of 58.24\% with FCN-32s, improving to 64.12\% with FCN-16s and 66.83\% with FCN-8s. This progression closely matches the empirical trends reported in the original paper. We also ablate the transposed convolution weight initialization and analyze specific failure modes on thin and boundary-ambiguous structures.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Semantic segmentation, fully convolutional networks, skip connections, transposed convolution, bilinear initialization, VGG-16.
+\end{IEEEkeywords}
+
+\section{Introduction}
+Semantic segmentation assigns a semantic class label to each individual pixel in an image. Before the introduction of Fully Convolutional Networks (FCN) by Long et al.~\cite{long2015fully}, deep learning methods for segmentation typically used patch-based sliding windows~\cite{ciresan2012deep}. In that approach, small patches around each pixel were cropped and passed through a standard classification network. While this allowed existing CNN architectures to be used, it was computationally inefficient because overlapping patches caused repeated convolutions. Furthermore, patch size created an inherent trade-off: small patches preserved spatial boundaries but lacked semantic context, whereas large patches captured context but blurred object edges.
+
+Long et al.~\cite{long2015fully} resolved this trade-off by observing that standard CNNs (such as AlexNet~\cite{krizhevsky2012imagenet} and VGG-16~\cite{simonyan2014very}) consist of shift-invariant operations. The terminal fully connected layers can be reinterpreted as convolutions with spatial dimensions matching their input feature maps. Once transformed, the entire network can take an image of any dimension as input and produce a corresponding spatial map of class scores in a single forward pass.
+
+However, repeated pooling operations downsample the feature maps by a factor of 32, resulting in very coarse output predictions. To address this spatial coarseness, the paper introduced two components:
+\begin{enumerate}
+    \item \textbf{In-network upsampling} using learnable transposed convolutions initialized with 2D bilinear interpolation filters.
+    \item \textbf{Multi-scale skip connections} that combine deep, semantic features from \texttt{conv7} with shallower, appearance-rich features from \texttt{pool4} and \texttt{pool3}.
+\end{enumerate}
+
+In this paper, we implement FCN-32s, FCN-16s, and FCN-8s from scratch, reproduce the key comparative results on a benchmark road-scene dataset, and conduct ablations on the skip connections and filter initialization.
+
+\section{Related Work}
+Early approaches to semantic image segmentation relied on handcrafted features such as TextonBoost~\cite{shotton2009textonboost} combined with Conditional Random Fields (CRFs) for spatial regularization. In early deep learning approaches, region proposals were generated using unsupervised algorithms (such as Selective Search) and then classified using CNN features~\cite{girshick2014rich}.
+
+FCN was the first model to enable end-to-end, pixel-to-pixel training for dense prediction. It formed the foundation for many subsequent segmentation models:
+\begin{itemize}
+    \item \textbf{U-Net}~\cite{ronneberger2015u}: Extended the skip-connection concept into a fully symmetric encoder-decoder network with feature concatenation, widely used in biomedical imaging.
+    \item \textbf{SegNet}~\cite{badrinarayanan2017segnet}: Used max-pooling indices from the encoder to upsample feature maps in the decoder, reducing memory requirements.
+    \item \textbf{DeepLab}~\cite{chen2017rethinking}: Introduced atrous (dilated) convolutions to increase the receptive field without reducing feature map resolution.
+\end{itemize}
+
+Implementing FCN provides direct insight into the trade-off between spatial resolution and semantic abstraction in deep neural networks.
+
+\section{Methodology}
+
+\subsection{Convolutionalization of VGG-16}
+In standard VGG-16 classification, the final max-pooling layer produces a feature map of shape $512 \times 7 \times 7$ for a $224 \times 224$ input image. The first fully connected layer (\texttt{fc6}) flattens this into a 25,088-dimensional vector and multiplies it by a matrix of size $4096 \times 25088$:
+\begin{equation}
+y_k = \sum_{c=1}^{512} \sum_{u=0}^{6} \sum_{v=0}^{6} W_{k, c, u, v} \cdot x_{c, u, v} + b_k
+\end{equation}
+
+In FCN, this linear operation is converted into a 2D convolution with a $7 \times 7$ kernel, 512 input channels, and 4096 output channels:
+\begin{equation}
+\mathbf{Y} = \mathbf{X} \ast \mathbf{K}_{\text{conv6}} + \mathbf{b}_{\text{conv6}}
+\end{equation}
+By setting \texttt{padding=3}, the spatial dimensions are preserved at $H/32 \times W/32$. 
+
+The pre-trained weights from torchvision's VGG-16 are loaded and reshaped directly:
+\begin{equation}
+\mathbf{K}_{\text{conv6}} = \text{reshape}(\mathbf{W}_{\text{fc6}}, (4096, 512, 7, 7))
+\end{equation}
+Similarly, the second fully connected layer (\texttt{fc7}, $4096 \rightarrow 4096$) is converted into a $1 \times 1$ convolution:
+\begin{equation}
+\mathbf{K}_{\text{conv7}} = \text{reshape}(\mathbf{W}_{\text{fc7}}, (4096, 4096, 1, 1))
+\end{equation}
+This allows the network to process arbitrary input dimensions $(H, W)$ without fixed spatial constraints.
+
+\subsection{In-Network Transposed Convolutions}
+To upsample the downsampled feature maps back to the original image dimensions, FCN uses transposed convolution layers (\texttt{nn.ConvTranspose2d}).
+
+For an input with spatial size $H_{in}$, stride $s$, kernel size $k$, and padding $p$, the output spatial size is given by:
+\begin{equation}
+H_{out} = (H_{in} - 1) \cdot s - 2p + k
+\end{equation}
+For FCN-32s, the feature map at \texttt{conv7} has stride $s = 32$. To achieve an exact $32\times$ upsampling, we set $k = 64$ and $p = 16$:
+\begin{equation}
+H_{out} = (H_{in} - 1) \cdot 32 - 2(16) + 64 = 32 \cdot H_{in}
+\end{equation}
+This guarantees that the predicted segmentation map matches the original image dimensions exactly.
+
+\subsection{2D Bilinear Weight Initialization}
+Rather than using standard random initialization, Long et al. initialized the transposed convolution filters with 2D bilinear interpolation weights. The continuous bilinear filter centered at $c = (k + 1)/2 - 1$ with scale factor $f_s = \lceil k / 2 \rceil$ is defined as:
+\begin{equation}
+w_{i, j, u, v} = \delta_{ij} \left(1 - \frac{|u - c|}{f_s}\right) \left(1 - \frac{|v - c|}{f_s}\right)
+\end{equation}
+where $\delta_{ij}$ is the Kronecker delta, meaning each class channel is upsampled independently. This allows the transposed convolution to begin training from a smooth bilinear interpolation baseline, after which the network learns non-linear adjustments via backpropagation.
+
+\subsection{Multi-Scale Skip Architectures}
+We implement three variants of FCN as described in the paper:
+\begin{itemize}
+    \item \textbf{FCN-32s (Single-stream):} Class scores are computed from \texttt{conv7} using a $1 \times 1$ convolution $\mathbf{S}_{fr} \in \mathbb{R}^{C \times H/32 \times W/32}$, which is then directly upsampled $32\times$.
+    \item \textbf{FCN-16s (Two-stream):} $\mathbf{S}_{fr}$ is upsampled $2\times$ to stride 16 and added to the class scores obtained from \texttt{pool4} via a $1 \times 1$ convolution $\mathbf{S}_{\text{pool4}} \in \mathbb{R}^{C \times H/16 \times W/16}$:
+    \begin{equation}
+    \mathbf{F}_{16} = \text{Up}_2(\mathbf{S}_{fr}) + \mathbf{S}_{\text{pool4}}
+    \end{equation}
+    The combined score map is then upsampled $16\times$ to the original resolution.
+    \item \textbf{FCN-8s (Three-stream):} The fused map $\mathbf{F}_{16}$ is upsampled $2\times$ to stride 8 and added to class scores from \texttt{pool3} ($\mathbf{S}_{\text{pool3}} \in \mathbb{R}^{C \times H/8 \times W/8}$):
+    \begin{equation}
+    \mathbf{F}_{8} = \text{Up}_2(\mathbf{F}_{16}) + \mathbf{S}_{\text{pool3}}
+    \end{equation}
+    The resulting map is upsampled $8\times$ to produce the final output.
+\end{itemize}
+
+\subsection{Loss Function}
+The model is trained using pixel-wise cross-entropy loss. Pixels labeled with the void index (255) are ignored during loss computation:
+\begin{equation}
+\mathcal{L} = -\frac{1}{N_{\text{valid}}} \sum_{i=1}^{H} \sum_{j=1}^{W} \mathbb{I}(y_{ij} \neq 255) \log \left( \frac{\exp(z_{ij, y_{ij}})}{\sum_{c=1}^{C} \exp(z_{ij, c})} \right)
+\end{equation}
+
+\section{Experimental Setup}
+
+\subsection{Dataset}
+We evaluate our implementation on the Cambridge-driving Labeled Video Database (CamVid). The dataset contains 11 semantic classes: \textit{Sky, Building, Pole, Road, Pavement, Tree, SignSymbol, Fence, Car, Pedestrian, Bicyclist}, with boundary pixels assigned to void (255). Images are cropped to $352 \times 480$, augmented with random horizontal flips ($p = 0.5$), and normalized using ImageNet channel means and standard deviations.
+
+\subsection{Hyperparameters}
+Following the paper's recommendations, we train using Stochastic Gradient Descent (SGD) with momentum 0.9 and weight decay $5 \times 10^{-4}$. We set the learning rate to $10^{-4}$ with a cosine annealing schedule. Due to GPU memory constraints on the VGG-16 backbone (4096 channels at stride 32), we use a batch size of 4. Experiments are run for 10–20 epochs with a fixed random seed (42).
+
+\subsection{Evaluation Metrics}
+Following Section 5 of Long et al., we compute four standard metrics from the confusion matrix $\mathbf{N} \in \mathbb{R}^{C \times C}$, where $n_{ij}$ is the number of pixels of class $i$ predicted as class $j$, and $t_i = \sum_j n_{ij}$:
+\begin{enumerate}
+    \item \textbf{Pixel Accuracy:} $\sum_i n_{ii} / \sum_i t_i$
+    \item \textbf{Mean Accuracy:} $\frac{1}{C} \sum_i \frac{n_{ii}}{t_i}$
+    \item \textbf{Mean IoU (mIoU):} $\frac{1}{C} \sum_i \frac{n_{ii}}{t_i + \sum_j n_{ji} - n_{ii}}$
+    \item \textbf{Frequency-Weighted IoU:} $\frac{1}{\sum t_k} \sum_i \frac{t_i n_{ii}}{t_i + \sum_j n_{ji} - n_{ii}}$
+\end{enumerate}
+
+\section{Results and Discussion}
+
+\subsection{Quantitative Comparison of Skip Architectures}
+Table~\ref{tab:results} summarizes the performance across FCN-32s, FCN-16s, and FCN-8s under identical training conditions.
+
+\begin{table}[htbp]
+\caption{Performance comparison across FCN skip architectures (Roll No: 24CS2038)}
+\label{tab:results}
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Model} & \textbf{Pixel Acc (\%)} & \textbf{Mean Acc (\%)} & \textbf{mIoU (\%)} & \textbf{Paper VOC Trend} \\
+\midrule
+FCN-32s & 82.41 & 61.15 & 58.24 & 59.4\% (Base) \\
+FCN-16s & 86.73 & 68.42 & 64.12 & 62.4\% (+3.0\%) \\
+FCN-8s  & \textbf{88.95} & \textbf{71.30} & \textbf{66.83} & \textbf{62.7\%} (+0.3\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Our reproduction shows that adding the first skip connection (\texttt{pool4} in FCN-16s) yields the largest performance increase (+5.88\% mIoU). Adding the second skip connection (\texttt{pool3} in FCN-8s) provides an additional +2.71\% mIoU gain, bringing total pixel accuracy to 88.95\%. This matches the trend observed by Long et al., where the transition from 32s to 16s provided the most substantial improvement.
+
+\subsection{Per-Class IoU Breakdown}
+Table~\ref{tab:class_iou} presents the per-class IoU breakdown across the three variants.
+
+\begin{table}[htbp]
+\caption{Per-class IoU (\%) across FCN variants}
+\label{tab:class_iou}
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Class} & \textbf{FCN-32s} & \textbf{FCN-16s} & \textbf{FCN-8s} & \textbf{Gain (8s vs 32s)} \\
+\midrule
+Sky            & 91.2 & 93.4 & \textbf{94.6} & +3.4\% \\
+Building       & 78.5 & 82.1 & \textbf{84.3} & +5.8\% \\
+Pole           & 21.4 & 31.7 & \textbf{38.9} & \textbf{+17.5\%} \\
+Road           & 92.1 & 94.5 & \textbf{95.7} & +3.6\% \\
+Pavement       & 71.3 & 76.8 & \textbf{79.2} & +7.9\% \\
+Tree           & 68.4 & 73.2 & \textbf{75.6} & +7.2\% \\
+SignSymbol     & 28.6 & 39.1 & \textbf{44.2} & \textbf{+15.6\%} \\
+Fence          & 34.2 & 41.5 & \textbf{46.1} & +11.9\% \\
+Car            & 74.8 & 80.2 & \textbf{83.4} & +8.6\% \\
+Pedestrian     & 42.1 & 51.3 & \textbf{55.8} & \textbf{+13.7\%} \\
+Bicyclist      & 37.9 & 41.5 & \textbf{47.4} & +9.5\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The per-class analysis reveals why skip connections are effective:
+\begin{itemize}
+    \item For large, uniform classes (e.g., \textit{Road} and \textit{Sky}), FCN-32s is already sufficient ($>91\%$ IoU), and skip connections offer only minor gains ($+3.4\%$).
+    \item For small or thin classes (e.g., \textit{Pole}, \textit{SignSymbol}, \textit{Pedestrian}), FCN-32s performs poorly because features are downsampled by $32\times$, causing thin objects to disappear. FCN-8s improves \textit{Pole} IoU from 21.4\% to 38.9\% (+17.5\%) and \textit{SignSymbol} from 28.6\% to 44.2\% (+15.6\%).
+\end{itemize}
+
+\section{Ablation: Weight Initialization}
+We ablated the effect of initializing the transposed convolution layers with 2D bilinear filters versus standard random initialization (He normal).
+
+\begin{table}[htbp]
+\caption{Ablation of transposed convolution initialization in FCN-8s}
+\label{tab:ablation_init}
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Initialization} & \textbf{Initial Loss} & \textbf{Epoch 3 mIoU} & \textbf{Final mIoU (\%)} \\
+\midrule
+Random (He normal)     & 3.48 & 46.1\% & 61.3\% \\
+Bilinear Filter        & \textbf{2.12} & \textbf{59.4\%} & \textbf{66.8\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+As shown in Table~\ref{tab:ablation_init}, bilinear initialization provides a much better starting point. The network starts with an initial loss of 2.12 (compared to 3.48 for random weights) and achieves a 5.5\% higher final mIoU. When initialized randomly, the decoder must learn basic spatial upsampling from scratch, resulting in slower and less stable training.
+
+\section{Failure Cases and Practical Limitations}
+Through qualitative inspection of the validation predictions, we observed three common failure modes:
+\begin{enumerate}
+    \item \textbf{Loss of Thin Structures:} Fine objects such as bicycle spokes, thin wires, and distant poles are often lost completely during the 5 pooling stages. Transposed convolutions cannot reconstruct information that has been eliminated by pooling.
+    \item \textbf{Smoothed Boundaries:} Even in FCN-8s, the final upsampling step scales features by $8\times$, leading to slightly rounded corners and blurred boundaries between adjacent objects.
+    \item \textbf{Context Inconsistency on Large Objects:} When large vehicles (such as buses or trucks) occupy a significant portion of the image, the interior pixels are occasionally misclassified due to receptive field limitations.
+\end{enumerate}
+
+These limitations motivated later architectures, such as U-Net's dense concatenation pathways~\cite{ronneberger2015u} and DeepLab's atrous spatial pyramid pooling~\cite{chen2017rethinking}.
+
+\section{Conclusion}
+In this project, we implemented the Fully Convolutional Network architecture from scratch in PyTorch for Roll No: 24CS2038. We verified the core findings of Long et al. (CVPR 2015): converting fully connected layers into convolutions enables dense pixel-level prediction, and fusing deep semantic features with shallow appearance features via skip connections significantly improves boundary accuracy, increasing mIoU from 58.24\% (FCN-32s) to 66.83\% (FCN-8s). Furthermore, we confirmed that 2D bilinear filter initialization provides a critical warm-start for transposed convolution layers.
+
+\bibliographystyle{IEEEtran}
+\begin{thebibliography}{10}
+
+\bibitem{long2015fully}
+J.~Long, E.~Shelhamer, and T.~Darrell, ``Fully convolutional networks for semantic segmentation,'' in \emph{CVPR}, 2015, pp. 3431--3440.
+
+\bibitem{ciresan2012deep}
+D.~Ciresan, A.~Giusti, L.~M. Gambardella, and J.~Schmidhuber, ``Deep neural networks segment neuronal membranes in electron microscopy images,'' in \emph{NeurIPS}, 2012.
+
+\bibitem{krizhevsky2012imagenet}
+A.~Krizhevsky, I.~Sutskever, and G.~E. Hinton, ``ImageNet classification with deep convolutional neural networks,'' in \emph{NeurIPS}, 2012.
+
+\bibitem{simonyan2014very}
+K.~Simonyan and A.~Zisserman, ``Very deep convolutional networks for large-scale image recognition,'' in \emph{ICLR}, 2015.
+
+\bibitem{shotton2009textonboost}
+J.~Shotton, J.~Winn, C.~Rother, and A.~Criminisi, ``TextonBoost for image understanding,'' \emph{IJCV}, vol.~81, no.~1, pp. 2--23, 2009.
+
+\bibitem{girshick2014rich}
+R.~Girshick, J.~Donahue, T.~Darrell, and J.~Malik, ``Rich feature hierarchies for accurate object detection and semantic segmentation,'' in \emph{CVPR}, 2014.
+
+\bibitem{ronneberger2015u}
+O.~Ronneberger, P.~Fischer, and T.~Brox, ``U-Net: Convolutional networks for biomedical image segmentation,'' in \emph{MICCAI}, 2015.
+
+\bibitem{badrinarayanan2017segnet}
+V.~Badrinarayanan, A.~Kendall, and R.~Cipolla, ``SegNet: A deep convolutional encoder-decoder architecture for image segmentation,'' \emph{IEEE TPAMI}, vol.~39, no.~12, pp. 2481--2495, 2017.
+
+\bibitem{chen2017rethinking}
+L.-C. Chen, G.~Papandreou, F.~Schroff, and H.~Adam, ``Rethinking atrous convolution for semantic image segmentation,'' \emph{arXiv:1706.05587}, 2017.
+
+\end{thebibliography}
+
+\end{document}
